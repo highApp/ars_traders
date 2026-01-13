@@ -1,6 +1,8 @@
 import 'dart:typed_data';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:uuid/uuid.dart';
@@ -8,6 +10,10 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:printing/printing.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
+import 'package:share_plus/share_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:cross_file/cross_file.dart';
 import '../models/product.dart';
 import '../models/sale.dart';
 import '../models/sale_item.dart';
@@ -212,12 +218,12 @@ class _POSScreenState extends State<POSScreen> {
                       }
 
                       return GridView.builder(
-                        padding: const EdgeInsets.all(16),
+                        padding: const EdgeInsets.all(12),
                         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                           crossAxisCount: 3,
-                          childAspectRatio: 0.75,
-                          crossAxisSpacing: 16,
-                          mainAxisSpacing: 16,
+                          childAspectRatio: 0.62,
+                          crossAxisSpacing: 12,
+                          mainAxisSpacing: 12,
                         ),
                         itemCount: availableProducts.length,
                         itemBuilder: (context, index) {
@@ -548,34 +554,41 @@ class _POSScreenState extends State<POSScreen> {
     }
   }
 
-  void _showReceiptDialog(BuildContext context, Sale sale, double existingDueTotal) {
+  void _showReceiptDialog(BuildContext context, Sale sale, double existingDueTotal) async {
     final formatter = NumberFormat.currency(symbol: 'Rs. ');
     final dateFormatter = DateFormat('MMM dd, yyyy - hh:mm a');
+    
+    // Load current language preference
+    final printerService = PrinterService();
+    String selectedLanguage = await printerService.getReceiptLanguage();
 
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => Dialog(
+      builder: (context) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => Dialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        child: Container(
-          width: 400,
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Success Icon
-              Container(
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: Colors.green.shade50,
-                  shape: BoxShape.circle,
-                ),
-                child: Icon(
-                  Icons.check_circle,
-                  color: Colors.green.shade600,
-                  size: 64,
-                ),
-              ),
+        child: Stack(
+          children: [
+            Container(
+              width: 400,
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Success Icon
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade50,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      Icons.check_circle,
+                      color: Colors.green.shade600,
+                      size: 64,
+                    ),
+                  ),
               const SizedBox(height: 20),
               const Text(
                 'Payment Successful!',
@@ -680,11 +693,23 @@ class _POSScreenState extends State<POSScreen> {
                       onPressed: () async {
                         debugPrint('Print button clicked');
                         try {
-                          // Check if printer IP is configured
+                          // Check if printer is configured
                           final printerService = PrinterService();
-                          final printerIp = await printerService.getPrinterIp();
+                          final connectionType = await printerService.getConnectionType();
                           
-                          if (printerIp == null || printerIp.isEmpty) {
+                          bool needsConfiguration = false;
+                          if (connectionType == PrinterConnectionType.wifi) {
+                            final printerIp = await printerService.getPrinterIp();
+                            needsConfiguration = printerIp == null || printerIp.isEmpty;
+                          } else if (connectionType == PrinterConnectionType.bluetooth) {
+                            final btDeviceId = await printerService.getBluetoothDeviceId();
+                            needsConfiguration = btDeviceId == null;
+                          } else if (connectionType == PrinterConnectionType.usb) {
+                            final usbDeviceId = await printerService.getUsbDeviceId();
+                            needsConfiguration = usbDeviceId == null;
+                          }
+                          
+                          if (needsConfiguration) {
                             // Show configuration dialog
                             if (context.mounted) {
                               await _showPrinterConfigDialog(context, printerService);
@@ -701,8 +726,11 @@ class _POSScreenState extends State<POSScreen> {
                             debugPrint('Seller fetched: ${seller?.name ?? 'null'}');
                           }
 
+                          // Get current language preference
+                          final currentLanguage = await printerService.getReceiptLanguage();
+                          
                           // Print directly to thermal printer
-                          final success = await printerService.printReceipt(sale, existingDueTotal, seller);
+                          final success = await printerService.printReceipt(sale, existingDueTotal, seller, languageCode: currentLanguage);
                           
                           if (success && context.mounted) {
                             ScaffoldMessenger.of(context).showSnackBar(
@@ -712,16 +740,61 @@ class _POSScreenState extends State<POSScreen> {
                                 duration: Duration(seconds: 2),
                               ),
                             );
+                          } else if (context.mounted) {
+                            // Get connection type to show appropriate error
+                            final currentConnectionType = await printerService.getConnectionType();
+                            String errorMessage = 'Failed to print receipt. Please check printer connection.';
+                            
+                            if (currentConnectionType == PrinterConnectionType.bluetooth) {
+                              errorMessage = 'Bluetooth printing failed. Your printer may use classic Bluetooth (SPP) which is not supported by web browsers. Please use WiFi connection instead, or use a BLE-compatible printer.';
+                            }
+                            
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(errorMessage),
+                                backgroundColor: Colors.red,
+                                duration: const Duration(seconds: 8),
+                                action: SnackBarAction(
+                                  label: 'Use WiFi',
+                                  textColor: Colors.white,
+                                  onPressed: () {
+                                    // Open printer config dialog
+                                    final service = PrinterService();
+                                    _showPrinterConfigDialog(context, service);
+                                  },
+                                ),
+                              ),
+                            );
                           }
                         } catch (e, stackTrace) {
                           debugPrint('Error printing receipt: $e');
                           debugPrint('Stack trace: $stackTrace');
                           if (context.mounted) {
+                            final errorMsg = e.toString();
+                            String userMessage = 'Print error: $e';
+                            
+                            // Check if it's the unsupported device error
+                            if (errorMsg.contains('Unsupported device') || 
+                                errorMsg.contains('classic Bluetooth') ||
+                                errorMsg.contains('SPP') ||
+                                errorMsg.contains('No Services found')) {
+                              userMessage = 'Your printer uses classic Bluetooth (SPP) which is not supported by Web Bluetooth API. Web browsers only support Bluetooth Low Energy (BLE) devices. Please use WiFi connection instead.';
+                            }
+                            
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
-                                content: Text('Print error: $e'),
+                                content: Text(userMessage),
                                 backgroundColor: Colors.red,
-                                duration: const Duration(seconds: 5),
+                                duration: const Duration(seconds: 8),
+                                action: SnackBarAction(
+                                  label: 'Use WiFi',
+                                  textColor: Colors.white,
+                                  onPressed: () {
+                                    // Open printer config dialog
+                                    final service = PrinterService();
+                                    _showPrinterConfigDialog(context, service);
+                                  },
+                                ),
                               ),
                             );
                           }
@@ -735,6 +808,27 @@ class _POSScreenState extends State<POSScreen> {
                           borderRadius: BorderRadius.circular(12),
                         ),
                       ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  // WhatsApp Icon Button
+                  Container(
+                    width: 50,
+                    height: 50,
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade600,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: IconButton(
+                      onPressed: () async {
+                        await _shareViaWhatsApp(context, sale, existingDueTotal);
+                      },
+                      icon: const Icon(
+                        Icons.chat_bubble,
+                        color: Colors.white,
+                        size: 24,
+                      ),
+                      tooltip: 'Share via WhatsApp',
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -759,11 +853,200 @@ class _POSScreenState extends State<POSScreen> {
             ],
           ),
         ),
+            // Refresh Icon Button at Top Left (Reset Print Settings)
+            Positioned(
+              top: 8,
+              left: 8,
+              child: IconButton(
+                onPressed: () async {
+                  // Show confirmation dialog
+                  final shouldReset = await showDialog<bool>(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Row(
+                        children: [
+                          Icon(Icons.refresh, color: Colors.orange),
+                          SizedBox(width: 12),
+                          Text('Reset Print Settings'),
+                        ],
+                      ),
+                      content: const Text(
+                        'Are you sure you want to reset all printer settings? This will clear the printer IP, port, connection type, and device information.',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('Cancel'),
+                        ),
+                        ElevatedButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.orange,
+                            foregroundColor: Colors.white,
+                          ),
+                          child: const Text('Reset'),
+                        ),
+                      ],
+                    ),
+                  );
+
+                  if (shouldReset == true) {
+                    try {
+                      final printerService = PrinterService();
+                      await printerService.resetPrinterSettings();
+                      
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Print settings have been reset successfully'),
+                            backgroundColor: Colors.green,
+                            duration: Duration(seconds: 2),
+                          ),
+                        );
+                      }
+                    } catch (e) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('Error resetting print settings: $e'),
+                            backgroundColor: Colors.red,
+                            duration: const Duration(seconds: 3),
+                          ),
+                        );
+                      }
+                    }
+                  }
+                },
+                icon: const Icon(
+                  Icons.refresh,
+                  color: Colors.orange,
+                ),
+                tooltip: 'Reset Print Settings',
+                style: IconButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  padding: const EdgeInsets.all(8),
+                ),
+              ),
+            ),
+            // Language Selector Icon Button (between refresh and eye)
+            Positioned(
+              top: 8,
+              right: 56,
+              child: PopupMenuButton<String>(
+                icon: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Icon(
+                    Icons.language,
+                    color: Colors.blue,
+                  ),
+                ),
+                tooltip: 'Select Receipt Language',
+                onSelected: (String language) async {
+                  setDialogState(() {
+                    selectedLanguage = language;
+                  });
+                  await printerService.setReceiptLanguage(language);
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(dialogContext).showSnackBar(
+                      SnackBar(
+                        content: Text('Receipt language set to: ${_getLanguageName(language)}'),
+                        duration: const Duration(seconds: 2),
+                        backgroundColor: Colors.green,
+                      ),
+                    );
+                  }
+                },
+                itemBuilder: (BuildContext context) => [
+                  PopupMenuItem<String>(
+                    value: 'en',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.check,
+                          size: 16,
+                          color: selectedLanguage == 'en' ? Colors.green : Colors.transparent,
+                        ),
+                        const SizedBox(width: 8),
+                        const Text('English'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem<String>(
+                    value: 'ur',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.check,
+                          size: 16,
+                          color: selectedLanguage == 'ur' ? Colors.green : Colors.transparent,
+                        ),
+                        const SizedBox(width: 8),
+                        const Text('Urdu'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem<String>(
+                    value: 'ar',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.check,
+                          size: 16,
+                          color: selectedLanguage == 'ar' ? Colors.green : Colors.transparent,
+                        ),
+                        const SizedBox(width: 8),
+                        const Text('Arabic'),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            // Eye Icon Button at Top Right
+            Positioned(
+              top: 8,
+              right: 8,
+              child: IconButton(
+                onPressed: () {
+                  Navigator.pop(context); // Close the success dialog first
+                  _showPrintPreview(context, sale, existingDueTotal, languageCode: selectedLanguage);
+                },
+                icon: const Icon(
+                  Icons.visibility,
+                  color: Colors.grey,
+                ),
+                tooltip: 'Preview Receipt',
+                style: IconButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  padding: const EdgeInsets.all(8),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
+        ),
     );
   }
 
-  Future<void> _showPrintPreview(BuildContext context, Sale sale, double existingDueTotal) async {
+  String _getLanguageName(String code) {
+    switch (code) {
+      case 'en':
+        return 'English';
+      case 'ur':
+        return 'Urdu';
+      case 'ar':
+        return 'Arabic';
+      default:
+        return 'English';
+    }
+  }
+
+  Future<void> _showPrintPreview(BuildContext context, Sale sale, double existingDueTotal, {String? languageCode}) async {
     try {
       debugPrint('=== Starting Print Preview ===');
       
@@ -821,7 +1104,8 @@ class _POSScreenState extends State<POSScreen> {
                     child: PdfPreview(
                       build: (format) async {
                         try {
-                          return await _generateReceiptPDF(sale, existingDueTotal, seller);
+                          final lang = languageCode ?? await PrinterService().getReceiptLanguage();
+                          return await _generateReceiptPDF(sale, existingDueTotal, seller, languageCode: lang);
                         } catch (e) {
                           debugPrint('PDF Generation Error: $e');
                           rethrow;
@@ -846,7 +1130,8 @@ class _POSScreenState extends State<POSScreen> {
                       ElevatedButton.icon(
                         onPressed: () async {
                           try {
-                            final pdf = await _generateReceiptPDF(sale, existingDueTotal, seller);
+                            final lang = languageCode ?? await PrinterService().getReceiptLanguage();
+                            final pdf = await _generateReceiptPDF(sale, existingDueTotal, seller, languageCode: lang);
                             await Printing.layoutPdf(
                               onLayout: (format) async => pdf,
                             );
@@ -891,11 +1176,204 @@ class _POSScreenState extends State<POSScreen> {
     }
   }
 
-  Future<Uint8List> _generateReceiptPDF(Sale sale, double existingDueTotal, Seller? seller) async {
+  Future<void> _shareViaWhatsApp(BuildContext context, Sale sale, double existingDueTotal) async {
+    try {
+      // Show loading indicator
+      if (context.mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => const Center(
+            child: CircularProgressIndicator(),
+          ),
+        );
+      }
+
+      // Fetch seller information if sellerId exists
+      Seller? seller;
+      if (sale.sellerId != null) {
+        final sellerService = SellerService();
+        seller = await sellerService.getSellerById(sale.sellerId!);
+      }
+
+      // Get current language preference
+      final printerService = PrinterService();
+      final currentLanguage = await printerService.getReceiptLanguage();
+      
+      // Generate PDF
+      final pdfBytes = await _generateReceiptPDF(sale, existingDueTotal, seller, languageCode: currentLanguage);
+
+      // Get seller phone number
+      String? phoneNumber = seller?.phone;
+      
+      // Clean phone number (remove spaces, dashes, etc.)
+      if (phoneNumber != null) {
+        phoneNumber = phoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
+        // Remove country code if present and add if needed
+        if (phoneNumber.startsWith('+')) {
+          // Keep as is
+        } else if (phoneNumber.startsWith('0')) {
+          // Remove leading 0 and add country code (assuming Pakistan +92)
+          phoneNumber = '+92${phoneNumber.substring(1)}';
+        } else {
+          // Add country code (assuming Pakistan +92)
+          phoneNumber = '+92$phoneNumber';
+        }
+      }
+
+      if (kIsWeb) {
+        // Web: Use WhatsApp Web API
+        if (phoneNumber != null && phoneNumber.isNotEmpty) {
+          // For web, download the PDF first, then open WhatsApp Web
+          // Download PDF using share_plus (works on web)
+          try {
+            final xFile = XFile.fromData(
+              pdfBytes,
+              mimeType: 'application/pdf',
+              name: 'receipt_${sale.id.substring(0, 8)}.pdf',
+            );
+            
+            // Share the file (will download on web)
+            await Share.shareXFiles([xFile], text: 'Receipt for Sale #${sale.id.substring(0, 8).toUpperCase()}');
+            
+            // Open WhatsApp Web with phone number
+            final whatsappUrl = Uri.parse('https://wa.me/$phoneNumber');
+            if (await canLaunchUrl(whatsappUrl)) {
+              await launchUrl(whatsappUrl, mode: LaunchMode.externalApplication);
+              
+              if (context.mounted) {
+                Navigator.pop(context); // Close loading
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('PDF downloaded. WhatsApp opened. Please attach the downloaded PDF file.'),
+                    duration: Duration(seconds: 4),
+                  ),
+                );
+              }
+            } else {
+              if (context.mounted) {
+                Navigator.pop(context); // Close loading
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('PDF downloaded. Could not open WhatsApp. Please open WhatsApp Web manually.'),
+                    backgroundColor: Colors.orange,
+                  ),
+                );
+              }
+            }
+          } catch (e) {
+            debugPrint('Error sharing PDF on web: $e');
+            // Fallback: just open WhatsApp
+            final whatsappUrl = Uri.parse('https://wa.me/$phoneNumber');
+            if (await canLaunchUrl(whatsappUrl)) {
+              await launchUrl(whatsappUrl, mode: LaunchMode.externalApplication);
+            }
+            if (context.mounted) {
+              Navigator.pop(context); // Close loading
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('WhatsApp opened. Please manually attach the receipt PDF. Error: $e'),
+                  duration: const Duration(seconds: 4),
+                ),
+              );
+            }
+          }
+        } else {
+          if (context.mounted) {
+            Navigator.pop(context); // Close loading
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Seller phone number not found. Cannot share via WhatsApp.'),
+                backgroundColor: Colors.orange,
+              ),
+            );
+          }
+        }
+      } else {
+        // Mobile (Android/iOS): Save PDF to temp file and share
+        final directory = await getTemporaryDirectory();
+        final file = File('${directory.path}/receipt_${sale.id.substring(0, 8)}.pdf');
+        await file.writeAsBytes(pdfBytes);
+
+        // Share the file
+        final result = await Share.shareXFiles(
+          [XFile(file.path)],
+          text: phoneNumber != null && phoneNumber.isNotEmpty
+              ? 'Receipt for Sale #${sale.id.substring(0, 8).toUpperCase()}'
+              : 'Receipt for Sale #${sale.id.substring(0, 8).toUpperCase()}',
+          subject: 'Receipt',
+        );
+
+        if (context.mounted) {
+          Navigator.pop(context); // Close loading
+          
+          if (result.status == ShareResultStatus.success) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Receipt shared successfully'),
+                backgroundColor: Colors.green,
+                duration: Duration(seconds: 2),
+              ),
+            );
+          }
+        }
+
+        // Clean up: delete temp file after a delay
+        Future.delayed(const Duration(seconds: 5), () {
+          try {
+            if (file.existsSync()) {
+              file.deleteSync();
+            }
+          } catch (e) {
+            debugPrint('Error deleting temp file: $e');
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint('Error sharing via WhatsApp: $e');
+      if (context.mounted) {
+        Navigator.pop(context); // Close loading
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error sharing via WhatsApp: $e'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<Uint8List> _generateReceiptPDF(Sale sale, double existingDueTotal, Seller? seller, {String languageCode = 'en'}) async {
     try {
       final pdf = pw.Document();
       final formatter = NumberFormat.currency(symbol: 'Rs. ', decimalDigits: 2);
       final dateFormatter = DateFormat('MMM dd, yyyy - hh:mm a');
+      
+      // Fetch products to get language-specific names
+      final productService = ProductService();
+      final Map<String, String> productNamesMap = {};
+      
+      // Fetch all products for this sale
+      for (var item in sale.items) {
+        try {
+          final product = await productService.getProductById(item.productId);
+          if (product != null) {
+            // Get name in selected language, fallback to English or displayName
+            final name = product.getName(languageCode) ?? 
+                        (languageCode == 'en' ? product.name : product.getName('en')) ?? 
+                        product.name;
+            productNamesMap[item.productId] = name;
+          } else {
+            // Fallback to stored productName if product not found
+            productNamesMap[item.productId] = item.productName;
+          }
+        } catch (e) {
+          debugPrint('Error fetching product ${item.productId}: $e');
+          // Fallback to stored productName
+          productNamesMap[item.productId] = item.productName;
+        }
+      }
 
       // Use monospace Courier font for receipt (standard receipt printer style)
       final font = pw.Font.courier();
@@ -927,53 +1405,44 @@ class _POSScreenState extends State<POSScreen> {
               ),
               pw.SizedBox(height: 4),
               
-              // Seller Information
+              // Seller Information - More Prominent
               if (seller != null) ...[
-                pw.Row(
-                  mainAxisAlignment: pw.MainAxisAlignment.start,
-                  children: [
-                    pw.Text(
-                      'Customer Name: ',
-                      style: textStyle(fontSize: 6, fontWeight: pw.FontWeight.bold),
-                    ),
-                    pw.Text(
-                      seller.name,
-                      style: textStyle(fontSize: 6),
-                    ),
-                  ],
+                pw.SizedBox(height: 4),
+                pw.Container(
+                  padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  decoration: pw.BoxDecoration(
+                    border: pw.Border.all(color: PdfColors.grey800, width: 0.8),
+                    borderRadius: const pw.BorderRadius.all(pw.Radius.circular(2)),
+                  ),
+                  child: pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      pw.Text(
+                        'CUSTOMER NAME:',
+                        style: textStyle(fontSize: 6, fontWeight: pw.FontWeight.bold),
+                      ),
+                      pw.SizedBox(height: 3),
+                      pw.Text(
+                        seller.name.toUpperCase(),
+                        style: textStyle(fontSize: 9, fontWeight: pw.FontWeight.bold),
+                      ),
+                      if (seller.phone != null && seller.phone!.isNotEmpty) ...[
+                        pw.SizedBox(height: 3),
+                        pw.Text(
+                          'Phone: ${seller.phone!}',
+                          style: textStyle(fontSize: 6),
+                        ),
+                      ],
+                      if (seller.location != null && seller.location!.isNotEmpty) ...[
+                        pw.SizedBox(height: 2),
+                        pw.Text(
+                          'Address: ${seller.location!}',
+                          style: textStyle(fontSize: 6),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
-                if (seller.phone != null && seller.phone!.isNotEmpty) ...[
-                  pw.SizedBox(height: 2),
-                  pw.Row(
-                    mainAxisAlignment: pw.MainAxisAlignment.start,
-                    children: [
-                      pw.Text(
-                        'Phone: ',
-                        style: textStyle(fontSize: 6, fontWeight: pw.FontWeight.bold),
-                      ),
-                      pw.Text(
-                        seller.phone!,
-                        style: textStyle(fontSize: 6),
-                      ),
-                    ],
-                  ),
-                ],
-                if (seller.location != null && seller.location!.isNotEmpty) ...[
-                  pw.SizedBox(height: 4),
-                  pw.Row(
-                    mainAxisAlignment: pw.MainAxisAlignment.start,
-                    children: [
-                      pw.Text(
-                        'Address: ',
-                        style: textStyle(fontSize: 6, fontWeight: pw.FontWeight.bold),
-                      ),
-                      pw.Text(
-                        seller.location!,
-                        style: textStyle(fontSize: 6),
-                      ),
-                    ],
-                  ),
-                ],
                 pw.SizedBox(height: 4),
               ],
               
@@ -1053,7 +1522,7 @@ class _POSScreenState extends State<POSScreen> {
                         pw.Expanded(
                           flex: 4,
                           child: pw.Text(
-                            item.productName,
+                            productNamesMap[item.productId] ?? item.productName,
                             style: textStyle(fontSize: 6),
                             maxLines: 2,
                             textAlign: pw.TextAlign.left,
@@ -1173,16 +1642,10 @@ class _POSScreenState extends State<POSScreen> {
               pw.Divider(thickness: 0.5),
               pw.SizedBox(height: 3),
               
-              // Order ID and Transaction ID
+              // Order ID
               pw.Text(
                 'Order ID: ${sale.id.substring(0, 8).toUpperCase()}',
                 style: textStyle(fontSize: 6, fontWeight: pw.FontWeight.bold),
-                textAlign: pw.TextAlign.center,
-              ),
-              pw.SizedBox(height: 4),
-              pw.Text(
-                'Transaction ID: ${sale.id.substring(0, 8).toUpperCase()}',
-                style: textStyle(fontSize: 6),
                 textAlign: pw.TextAlign.center,
               ),
               pw.SizedBox(height: 4),
@@ -1274,98 +1737,730 @@ class _POSScreenState extends State<POSScreen> {
     // Load existing settings
     final existingIp = await printerService.getPrinterIp();
     final existingPort = await printerService.getPrinterPort();
+    final existingConnectionType = await printerService.getConnectionType();
+    final existingBtDeviceName = await printerService.getBluetoothDeviceName();
+    
     if (existingIp != null) {
       ipController.text = existingIp;
     }
     portController.text = existingPort;
 
+    PrinterConnectionType selectedConnectionType = existingConnectionType;
+    String? selectedBtDeviceName = existingBtDeviceName;
+    String? selectedUsbDeviceName = await printerService.getUsbDeviceName();
+    bool isBluetoothAvailable = printerService.isBluetoothAvailable();
+    bool isUsbAvailable = printerService.isUsbAvailable();
+
     return showDialog(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Row(
-          children: [
-            Icon(Icons.print, color: Colors.green),
-            SizedBox(width: 8),
-            Text('Printer Configuration'),
-          ],
-        ),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Row(
             children: [
-              const Text(
-                'Configure your thermal printer network settings',
-                style: TextStyle(fontSize: 14, color: Colors.grey),
-              ),
-              const SizedBox(height: 20),
-              TextField(
-                controller: ipController,
-                decoration: const InputDecoration(
-                  labelText: 'Printer IP Address *',
-                  hintText: '192.168.1.23',
-                  prefixIcon: Icon(Icons.dns),
-                  border: OutlineInputBorder(),
-                  helperText: 'Enter the IP address of your thermal printer',
-                ),
-                keyboardType: TextInputType.numberWithOptions(decimal: true),
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: portController,
-                decoration: const InputDecoration(
-                  labelText: 'Printer Port',
-                  hintText: '9100',
-                  prefixIcon: Icon(Icons.settings_ethernet),
-                  border: OutlineInputBorder(),
-                  helperText: 'Default port for network thermal printers is 9100',
-                ),
-                keyboardType: TextInputType.number,
-              ),
+              Icon(Icons.print, color: Colors.green),
+              SizedBox(width: 8),
+              Text('Printer Configuration'),
             ],
           ),
-        ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Configure your SpeedX SP-90A thermal printer',
+                  style: TextStyle(fontSize: 14, color: Colors.grey),
+                ),
+                const SizedBox(height: 20),
+                
+                // Connection Type Selector
+                const Text(
+                  'Connection Type *',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: RadioListTile<PrinterConnectionType>(
+                        title: const Text('WiFi'),
+                        value: PrinterConnectionType.wifi,
+                        groupValue: selectedConnectionType,
+                        onChanged: (value) {
+                          setDialogState(() {
+                            selectedConnectionType = value!;
+                          });
+                        },
+                        dense: true,
+                      ),
+                    ),
+                    Expanded(
+                      child: RadioListTile<PrinterConnectionType>(
+                        title: const Text('Bluetooth'),
+                        value: PrinterConnectionType.bluetooth,
+                        groupValue: selectedConnectionType,
+                        onChanged: (value) {
+                          setDialogState(() {
+                            selectedConnectionType = value!;
+                          });
+                        },
+                        dense: true,
+                      ),
+                    ),
+                    Expanded(
+                      child: RadioListTile<PrinterConnectionType>(
+                        title: const Text('USB'),
+                        value: PrinterConnectionType.usb,
+                        groupValue: selectedConnectionType,
+                        onChanged: (value) {
+                          setDialogState(() {
+                            selectedConnectionType = value!;
+                          });
+                        },
+                        dense: true,
+                      ),
+                    ),
+                  ],
+                ),
+                
+                if (!isBluetoothAvailable && selectedConnectionType == PrinterConnectionType.bluetooth)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Text(
+                      'Bluetooth is only available on web (Chrome/Edge). Use WiFi for mobile/desktop.',
+                      style: TextStyle(fontSize: 12, color: Colors.orange[700]),
+                    ),
+                  ),
+                
+                if (!isUsbAvailable && selectedConnectionType == PrinterConnectionType.usb)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Text(
+                      'USB is only available on web (Chrome/Edge). Use WiFi for mobile/desktop.',
+                      style: TextStyle(fontSize: 12, color: Colors.orange[700]),
+                    ),
+                  ),
+                
+                const SizedBox(height: 16),
+                
+                // WiFi Configuration
+                if (selectedConnectionType == PrinterConnectionType.wifi) ...[
+                  TextField(
+                    controller: ipController,
+                    decoration: const InputDecoration(
+                      labelText: 'Printer IP Address *',
+                      hintText: '192.168.1.23',
+                      prefixIcon: Icon(Icons.dns),
+                      border: OutlineInputBorder(),
+                      helperText: 'Enter the IP address of your thermal printer',
+                    ),
+                    keyboardType: TextInputType.numberWithOptions(decimal: true),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: portController,
+                    decoration: const InputDecoration(
+                      labelText: 'Printer Port',
+                      hintText: '9100',
+                      prefixIcon: Icon(Icons.settings_ethernet),
+                      border: OutlineInputBorder(),
+                      helperText: 'Default port for network thermal printers is 9100',
+                    ),
+                    keyboardType: TextInputType.number,
+                  ),
+                ],
+                
+                // Bluetooth Configuration
+                if (selectedConnectionType == PrinterConnectionType.bluetooth && isBluetoothAvailable) ...[
+                  // Important note about Web Bluetooth
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.blue[50],
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.blue[200]!),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.info_outline, size: 16, color: Colors.blue[700]),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Important:',
+                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blue[900]),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Web Bluetooth API only supports Bluetooth Low Energy (BLE) devices.\nIf your printer uses classic Bluetooth (SPP), it will not work.\nIn that case, please use WiFi connection instead.\n\nJust ensure your printer is powered ON and Bluetooth is enabled.',
+                          style: TextStyle(fontSize: 11, color: Colors.blue[800]),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  if (selectedBtDeviceName != null) ...[
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.green[50],
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.green[200]!),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.bluetooth_connected, color: Colors.green[700]),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  'Selected Device:',
+                                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                                ),
+                                Text(
+                                  selectedBtDeviceName ?? 'Unknown',
+                                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.green[900]),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  ElevatedButton.icon(
+                    onPressed: () async {
+                      try {
+                        // Show loading indicator
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('Searching for Bluetooth devices...'),
+                              duration: Duration(seconds: 2),
+                            ),
+                          );
+                        }
+                        
+                        final device = await printerService.requestBluetoothDevice();
+                        if (device != null && context.mounted) {
+                          final deviceName = device['name'] as String?;
+                          final deviceId = device['id'] as String?;
+                          
+                          debugPrint('Device selection result: name=$deviceName, id=$deviceId');
+                          
+                          if (deviceName != null) {
+                            // Update the dialog state
+                            setDialogState(() {
+                              selectedBtDeviceName = deviceName;
+                            });
+                            
+                            // Verify the device was saved
+                            final savedId = await printerService.getBluetoothDeviceId();
+                            final savedName = await printerService.getBluetoothDeviceName();
+                            debugPrint('Device saved check: id=$savedId, name=$savedName');
+                            
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text('Bluetooth device selected: $deviceName'),
+                                backgroundColor: Colors.green,
+                                duration: const Duration(seconds: 3),
+                              ),
+                            );
+                          } else {
+                            debugPrint('Device name is null');
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Device selected but name is missing'),
+                                backgroundColor: Colors.orange,
+                              ),
+                            );
+                          }
+                        } else if (context.mounted) {
+                          debugPrint('No device returned from requestBluetoothDevice');
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('No device selected or selection cancelled'),
+                              backgroundColor: Colors.orange,
+                            ),
+                          );
+                        }
+                      } catch (e) {
+                        debugPrint('Error selecting Bluetooth device: $e');
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('Error: ${e.toString()}'),
+                              backgroundColor: Colors.red,
+                              duration: const Duration(seconds: 5),
+                            ),
+                          );
+                        }
+                      }
+                    },
+                    icon: const Icon(Icons.bluetooth_searching),
+                    label: Text(selectedBtDeviceName != null ? 'Change Device' : 'Select Bluetooth Device'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Printer Details:\n• Name: "BlueTooth Printer"\n• PIN: 1234 (entered automatically by browser)\n• Make sure printer is ON and Bluetooth enabled',
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+                ],
+                
+                // USB Configuration
+                if (selectedConnectionType == PrinterConnectionType.usb && isUsbAvailable) ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.blue[50],
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.blue[200]!),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.info_outline, size: 16, color: Colors.blue[700]),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Important:',
+                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blue[900]),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Web USB API requires Chrome, Edge, or Opera browser.\nMake sure your printer is connected via USB cable.\nThe browser will prompt you to select the device.',
+                          style: TextStyle(fontSize: 11, color: Colors.blue[800]),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  if (selectedUsbDeviceName != null) ...[
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.green[50],
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.green[200]!),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.usb, color: Colors.green[700]),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  'Selected Device:',
+                                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                                ),
+                                Text(
+                                  selectedUsbDeviceName ?? 'Unknown',
+                                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.green[900]),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  ElevatedButton.icon(
+                    onPressed: () async {
+                      try {
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('Requesting USB device access...'),
+                              duration: Duration(seconds: 2),
+                            ),
+                          );
+                        }
+                        
+                        final device = await printerService.requestUsbDevice();
+                        if (device != null && context.mounted) {
+                          final deviceName = device['name'] as String?;
+                          
+                          if (deviceName != null) {
+                            setDialogState(() {
+                              selectedUsbDeviceName = deviceName;
+                            });
+                            
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text('USB device selected: $deviceName'),
+                                backgroundColor: Colors.green,
+                                duration: const Duration(seconds: 3),
+                              ),
+                            );
+                          }
+                        }
+                      } catch (e) {
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('Error: ${e.toString()}'),
+                              backgroundColor: Colors.red,
+                              duration: const Duration(seconds: 5),
+                            ),
+                          );
+                        }
+                      }
+                    },
+                    icon: const Icon(Icons.usb),
+                    label: Text(selectedUsbDeviceName != null ? 'Change Device' : 'Select USB Device'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Make sure:\n• Printer is connected via USB cable\n• Printer is powered ON\n• Use Chrome, Edge, or Opera browser',
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+                ],
+              ],
+            ),
+          ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Cancel'),
           ),
-          ElevatedButton(
+          TextButton.icon(
             onPressed: () async {
-              final ip = ipController.text.trim();
-              final port = portController.text.trim();
-              
-              if (ip.isEmpty) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Please enter printer IP address'),
-                    backgroundColor: Colors.red,
-                  ),
-                );
-                return;
-              }
-
-              try {
-                await printerService.setPrinterIp(ip);
-                await printerService.setPrinterPort(port.isEmpty ? '9100' : port);
+              if (selectedConnectionType == PrinterConnectionType.wifi) {
+                final ip = ipController.text.trim();
+                final port = portController.text.trim();
                 
-                if (dialogContext.mounted) {
-                  Navigator.pop(dialogContext);
+                if (ip.isEmpty) {
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
-                      content: Text('Printer configuration saved successfully'),
-                      backgroundColor: Colors.green,
-                    ),
-                  );
-                }
-              } catch (e) {
-                if (dialogContext.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Error saving configuration: $e'),
+                      content: Text('Please enter printer IP address'),
                       backgroundColor: Colors.red,
                     ),
                   );
+                  return;
+                }
+
+                // Temporarily set IP and port for testing
+                final originalIp = await printerService.getPrinterIp();
+                final originalPort = await printerService.getPrinterPort();
+                final originalType = await printerService.getConnectionType();
+                
+                try {
+                  await printerService.setPrinterIp(ip);
+                  await printerService.setPrinterPort(port.isEmpty ? '9100' : port);
+                  await printerService.setConnectionType(PrinterConnectionType.wifi);
+                  
+                  // Show loading
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Testing connection...'),
+                        duration: Duration(seconds: 1),
+                      ),
+                    );
+                  }
+                  
+                  // Test connection
+                  final success = await printerService.testConnection();
+                  
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(success 
+                            ? 'Connection test successful! Printer is reachable.' 
+                            : 'Connection test failed. Please check IP address and ensure printer is on the same network.'),
+                        backgroundColor: success ? Colors.green : Colors.orange,
+                        duration: const Duration(seconds: 3),
+                      ),
+                    );
+                  }
+                  
+                  // Restore original settings if test failed
+                  if (!success) {
+                    if (originalIp != null) {
+                      await printerService.setPrinterIp(originalIp);
+                    }
+                    await printerService.setPrinterPort(originalPort);
+                    await printerService.setConnectionType(originalType);
+                  }
+                } catch (e) {
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Error testing connection: $e'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                  // Restore original settings
+                  if (originalIp != null) {
+                    await printerService.setPrinterIp(originalIp);
+                  }
+                  await printerService.setPrinterPort(originalPort);
+                  await printerService.setConnectionType(originalType);
+                }
+              } else if (selectedConnectionType == PrinterConnectionType.bluetooth) {
+                // Bluetooth test
+                if (selectedBtDeviceName == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Please select a Bluetooth device first'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                  return;
+                }
+
+                try {
+                  await printerService.setConnectionType(PrinterConnectionType.bluetooth);
+                  
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Testing Bluetooth connection...'),
+                        duration: Duration(seconds: 1),
+                      ),
+                    );
+                  }
+                  
+                  final success = await printerService.testConnection();
+                  
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(success 
+                            ? 'Bluetooth connection test successful!' 
+                            : 'Bluetooth connection test failed. Please ensure the printer is powered on and in range.'),
+                        backgroundColor: success ? Colors.green : Colors.orange,
+                        duration: const Duration(seconds: 3),
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Error testing Bluetooth connection: $e'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
+              } else if (selectedConnectionType == PrinterConnectionType.usb) {
+                // USB test
+                if (selectedUsbDeviceName == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Please select a USB device first'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                  return;
+                }
+
+                try {
+                  await printerService.setConnectionType(PrinterConnectionType.usb);
+                  
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Testing USB connection...'),
+                        duration: Duration(seconds: 1),
+                      ),
+                    );
+                  }
+                  
+                  final success = await printerService.testConnection();
+                  
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(success 
+                            ? 'USB connection test successful!' 
+                            : 'USB connection test failed. Please ensure the printer is connected via USB and powered on.'),
+                        backgroundColor: success ? Colors.green : Colors.orange,
+                        duration: const Duration(seconds: 3),
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Error testing USB connection: $e'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
+              }
+            },
+            icon: Icon(
+              selectedConnectionType == PrinterConnectionType.wifi 
+                  ? Icons.wifi_protected_setup 
+                  : selectedConnectionType == PrinterConnectionType.bluetooth
+                      ? Icons.bluetooth_searching
+                      : Icons.usb,
+              size: 18,
+            ),
+            label: const Text('Test'),
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.blue,
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              if (selectedConnectionType == PrinterConnectionType.wifi) {
+                final ip = ipController.text.trim();
+                final port = portController.text.trim();
+                
+                if (ip.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Please enter printer IP address'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                  return;
+                }
+
+                try {
+                  await printerService.setPrinterIp(ip);
+                  await printerService.setPrinterPort(port.isEmpty ? '9100' : port);
+                  await printerService.setConnectionType(PrinterConnectionType.wifi);
+                  
+                  if (dialogContext.mounted) {
+                    Navigator.pop(dialogContext);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Printer configuration saved successfully'),
+                        backgroundColor: Colors.green,
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Error saving configuration: $e'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
+              } else if (selectedConnectionType == PrinterConnectionType.bluetooth) {
+                // Bluetooth save
+                // Check if device is already saved in preferences or selected in dialog
+                final savedBtDeviceId = await printerService.getBluetoothDeviceId();
+                final savedBtDeviceName = await printerService.getBluetoothDeviceName();
+                
+                // Use selected device name if available, otherwise use saved
+                final deviceNameToUse = selectedBtDeviceName ?? savedBtDeviceName;
+                
+                // Check if we have either a device ID (which means device was selected) or a device name
+                if (savedBtDeviceId == null && deviceNameToUse == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Please select a Bluetooth device first. Click "Select Bluetooth Device" button.'),
+                      backgroundColor: Colors.red,
+                      duration: Duration(seconds: 4),
+                    ),
+                  );
+                  return;
+                }
+
+                try {
+                  // Ensure connection type is set to Bluetooth
+                  await printerService.setConnectionType(PrinterConnectionType.bluetooth);
+                  
+                  // If we have a selected device name but no saved device, the device was just selected
+                  // The device should already be saved by requestBluetoothDevice, but let's verify
+                  if (selectedBtDeviceName != null && savedBtDeviceId == null) {
+                    // This shouldn't happen, but if it does, show a warning
+                    debugPrint('Warning: Device name selected but device ID not saved');
+                  }
+                  
+                  if (dialogContext.mounted) {
+                    Navigator.pop(dialogContext);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Bluetooth printer configuration saved: ${deviceNameToUse ?? "Device"}'),
+                        backgroundColor: Colors.green,
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Error saving configuration: $e'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
+              } else if (selectedConnectionType == PrinterConnectionType.usb) {
+                // USB save
+                // Check if device is already saved in preferences or selected in dialog
+                final savedUsbDeviceId = await printerService.getUsbDeviceId();
+                final savedUsbDeviceName = await printerService.getUsbDeviceName();
+                
+                // Use selected device name if available, otherwise use saved
+                final deviceNameToUse = selectedUsbDeviceName ?? savedUsbDeviceName;
+                
+                // Check if we have either a device ID (which means device was selected) or a device name
+                if (savedUsbDeviceId == null && deviceNameToUse == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Please select a USB device first. Click "Select USB Device" button.'),
+                      backgroundColor: Colors.red,
+                      duration: Duration(seconds: 4),
+                    ),
+                  );
+                  return;
+                }
+
+                try {
+                  // Ensure connection type is set to USB
+                  await printerService.setConnectionType(PrinterConnectionType.usb);
+                  
+                  if (dialogContext.mounted) {
+                    Navigator.pop(dialogContext);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('USB printer configuration saved: ${deviceNameToUse ?? "Device"}'),
+                        backgroundColor: Colors.green,
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Error saving configuration: $e'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
                 }
               }
             },
@@ -1377,6 +2472,7 @@ class _POSScreenState extends State<POSScreen> {
           ),
         ],
       ),
+    ),
     );
   }
 }
@@ -1547,16 +2643,19 @@ class _ProductCard extends StatelessWidget {
                               : Colors.green,
                           borderRadius: BorderRadius.circular(12),
                         ),
+                        constraints: const BoxConstraints(maxWidth: 100),
                         child: Text(
-                          '${product.stock} in stock',
+                          '${product.stock.toStringAsFixed(product.stock % 1 == 0 ? 0 : 1)} in stock',
                           style: const TextStyle(
                             color: Colors.white,
                             fontSize: 10,
                             fontWeight: FontWeight.bold,
                           ),
-                              ),
-                            ),
-                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
                           // Wholesale indicator
                           if (hasWholesalePrice)
                             Positioned(
@@ -1600,117 +2699,134 @@ class _ProductCard extends StatelessWidget {
             Expanded(
               flex: 2,
               child: Container(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  mainAxisSize: MainAxisSize.max,
                   children: [
-                      Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          product.name,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 15,
-                          ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
+                    // Product name
+                    Flexible(
+                      flex: 2,
+                      child: Text(
+                        product.name,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 11,
+                          height: 1.1,
                         ),
-                        const SizedBox(height: 4),
-                        Row(
-                          children: [
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    // Category badges
+                    Flexible(
+                      flex: 1,
+                      child: Wrap(
+                        spacing: 2,
+                        runSpacing: 2,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 3,
+                              vertical: 1,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.grey[100],
+                              borderRadius: BorderRadius.circular(3),
+                            ),
+                            child: Text(
+                              product.category,
+                              style: TextStyle(
+                                fontSize: 7,
+                                color: Colors.grey[700],
+                                fontWeight: FontWeight.w500,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          if (product.formattedSize.isNotEmpty)
                             Container(
                               padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 2,
+                                horizontal: 3,
+                                vertical: 1,
                               ),
                               decoration: BoxDecoration(
-                                color: Colors.grey[100],
-                                borderRadius: BorderRadius.circular(8),
+                                color: Colors.blue[50],
+                                borderRadius: BorderRadius.circular(3),
                               ),
                               child: Text(
-                                product.category,
+                                product.formattedSize,
                                 style: TextStyle(
-                                  fontSize: 11,
-                                  color: Colors.grey[700],
-                                  fontWeight: FontWeight.w500,
+                                  fontSize: 7,
+                                  color: Colors.blue[700],
+                                  fontWeight: FontWeight.w600,
                                 ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                               ),
                             ),
-                            if (product.formattedSize.isNotEmpty) ...[
-                              const SizedBox(width: 4),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Colors.blue[50],
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                child: Text(
-                                  product.formattedSize,
+                        ],
+                      ),
+                    ),
+                    const Spacer(),
+                    // Price and add button
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (isWholesale && hasWholesalePrice)
+                                Text(
+                                  'W',
                                   style: TextStyle(
-                                    fontSize: 11,
+                                    fontSize: 6,
                                     color: Colors.blue[700],
                                     fontWeight: FontWeight.w600,
                                   ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                 ),
+                              if (isWholesale && !hasWholesalePrice)
+                                Text(
+                                  'N/A',
+                                  style: TextStyle(
+                                    fontSize: 6,
+                                    color: Colors.red[700],
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              Text(
+                                formatter.format(displayPrice),
+                                style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 11,
+                                  color: canAddToCart ? Colors.green : Colors.grey,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                               ),
                             ],
-                          ],
-                        ),
-                      ],
-                    ),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                              Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (isWholesale && hasWholesalePrice) ...[
-                        Text(
-                                      'Wholesale',
-                                      style: TextStyle(
-                                        fontSize: 10,
-                                        color: Colors.blue[700],
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                  ],
-                                  if (isWholesale && !hasWholesalePrice) ...[
-                                    Text(
-                                      'Not Available',
-                                      style: TextStyle(
-                                        fontSize: 10,
-                                        color: Colors.red[700],
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                  ],
-                                  Text(
-                                    formatter.format(displayPrice),
-                                    style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 18,
-                                      color: canAddToCart ? Colors.green : Colors.grey,
                           ),
-                                  ),
-                                ],
                         ),
+                        const SizedBox(width: 4),
                         Container(
-                          padding: const EdgeInsets.all(6),
+                          padding: const EdgeInsets.all(3),
                           decoration: BoxDecoration(
-                                  color: canAddToCart ? Colors.green : Colors.grey,
-                            borderRadius: BorderRadius.circular(8),
+                            color: canAddToCart ? Colors.green : Colors.grey,
+                            borderRadius: BorderRadius.circular(4),
                           ),
                           child: const Icon(
                             Icons.add_shopping_cart,
                             color: Colors.white,
-                            size: 18,
+                            size: 12,
                           ),
                         ),
                       ],
@@ -1902,11 +3018,13 @@ class _CartPanel extends StatelessWidget {
                 );
               }
 
+              // Reverse the list to show most recently added items first
+              final cartItemsList = cart.items.values.toList().reversed.toList();
               return ListView.builder(
                 padding: const EdgeInsets.symmetric(vertical: 8),
-                itemCount: cart.items.length,
+                itemCount: cartItemsList.length,
                 itemBuilder: (context, index) {
-                  final cartItem = cart.items.values.toList()[index];
+                  final cartItem = cartItemsList[index];
                   return _CartItemTile(cartItem: cartItem);
                 },
               );
@@ -2304,13 +3422,17 @@ class _CartSummary extends StatelessWidget {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text(
-                          'Subtotal (${cart.totalItems} items)',
-                          style: TextStyle(
-                            fontSize: 15,
-                            color: Colors.grey[700],
+                        Flexible(
+                          child: Text(
+                            'Subtotal (${cart.totalItems.toStringAsFixed(1)} items)',
+                            style: TextStyle(
+                              fontSize: 15,
+                              color: Colors.grey[700],
+                            ),
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
+                        const SizedBox(width: 8),
                         Text(
                           formatter.format(cart.totalAmount),
                           style: const TextStyle(
